@@ -1,225 +1,163 @@
-// Cargo.toml
-[package]
-name = "token_estate"
-version = "0.1.0"
-edition = "2021"
-
+// Cargo.toml additions
 [dependencies]
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tokio = { version = "1.0", features = ["full"] }
-rust_decimal = "1.32"
-chrono = "0.4"
-uuid = { version = "1.6", features = ["v4"] }
+clarity-sdk = "1.0"
+reqwest = { version = "0.11", features = ["json"] }
+sha2 = "0.10"
+jsonwebtoken = "8.1"
+ring = "0.16"
 
-// src/lib.rs
-use rust_decimal::Decimal;
+// src/blockchain_integration.rs
+use clarity_sdk::{clarity_post, Contract, TransactionReceipt};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use uuid::Uuid;
-use chrono::{DateTime, Utc};
+use sha2::{Sha256, Digest};
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Property {
-    pub id: Uuid,
-    pub address: String,
-    pub total_value: Decimal,
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BlockchainProperty {
+    pub property_id: u64,
     pub total_tokens: u64,
-    pub tokens_available: u64,
-    pub price_per_token: Decimal,
-    pub metadata: PropertyMetadata,
+    pub available_tokens: u64,
+    pub price_per_token: u64,
+    pub property_hash: Vec<u8>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct PropertyMetadata {
-    pub square_feet: u32,
-    pub year_built: u16,
-    pub property_type: PropertyType,
-    pub description: String,
-    pub images: Vec<String>,
+pub struct BlockchainConnector {
+    contract_address: String,
+    network_url: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub enum PropertyType {
-    Residential,
-    Commercial,
-    Industrial,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct TokenHolder {
-    pub id: Uuid,
-    pub wallet_address: String,
-    pub holdings: HashMap<Uuid, u64>, // Property ID -> Number of tokens
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Trade {
-    pub id: Uuid,
-    pub property_id: Uuid,
-    pub seller_id: Uuid,
-    pub buyer_id: Option<Uuid>,
-    pub tokens: u64,
-    pub price_per_token: Decimal,
-    pub status: TradeStatus,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub enum TradeStatus {
-    Open,
-    Completed,
-    Cancelled,
-}
-
-// src/tokenization_engine.rs
-pub struct TokenizationEngine {
-    properties: HashMap<Uuid, Property>,
-    token_holders: HashMap<Uuid, TokenHolder>,
-    trades: Vec<Trade>,
-}
-
-impl TokenizationEngine {
-    pub fn new() -> Self {
-        TokenizationEngine {
-            properties: HashMap::new(),
-            token_holders: HashMap::new(),
-            trades: Vec::new(),
-        }
+impl BlockchainConnector {
+    pub async fn tokenize_property(
+        &self,
+        property: &Property,
+        wallet_credentials: &WalletCredentials,
+    ) -> Result<TransactionReceipt, Box<dyn std::error::Error>> {
+        let property_hash = self.generate_property_hash(property);
+        
+        let tx = clarity_post(
+            &self.network_url,
+            &self.contract_address,
+            "tokenize-property",
+            &[
+                property.total_tokens.to_string(),
+                property.price_per_token.to_string(),
+                hex::encode(property_hash),
+            ],
+            wallet_credentials,
+        ).await?;
+        
+        Ok(tx)
     }
+    
+    fn generate_property_hash(&self, property: &Property) -> Vec<u8> {
+        let mut hasher = Sha256::new();
+        hasher.update(property.address.as_bytes());
+        hasher.update(property.total_value.to_string().as_bytes());
+        hasher.finalize().to_vec()
+    }
+}
 
-    pub fn tokenize_property(
+// src/enhanced_tokenization.rs
+pub struct EnhancedTokenizationEngine {
+    basic_engine: TokenizationEngine,
+    blockchain_connector: BlockchainConnector,
+    market_analyzer: MarketAnalyzer,
+}
+
+impl EnhancedTokenizationEngine {
+    pub async fn tokenize_property_with_blockchain(
         &mut self,
-        address: String,
-        total_value: Decimal,
-        total_tokens: u64,
-        metadata: PropertyMetadata,
-    ) -> Result<Uuid, &'static str> {
-        let property_id = Uuid::new_v4();
-        let price_per_token = total_value / Decimal::from(total_tokens);
-
-        let property = Property {
-            id: property_id,
-            address,
-            total_value,
-            total_tokens,
-            tokens_available: total_tokens,
-            price_per_token,
-            metadata,
-        };
-
-        self.properties.insert(property_id, property);
+        property_data: PropertyCreate,
+        wallet_credentials: WalletCredentials,
+    ) -> Result<Uuid, Box<dyn std::error::Error>> {
+        // Create property in local system
+        let property_id = self.basic_engine.tokenize_property(
+            property_data.address,
+            property_data.total_value,
+            property_data.total_tokens,
+            property_data.metadata,
+        )?;
+        
+        // Register on blockchain
+        let property = self.basic_engine.properties.get(&property_id).unwrap();
+        self.blockchain_connector.tokenize_property(property, &wallet_credentials).await?;
+        
         Ok(property_id)
     }
-
-    pub fn create_token_holder(&mut self, wallet_address: String) -> Uuid {
-        let holder_id = Uuid::new_v4();
-        let holder = TokenHolder {
-            id: holder_id,
-            wallet_address,
-            holdings: HashMap::new(),
-        };
-        self.token_holders.insert(holder_id, holder);
-        holder_id
-    }
-
-    pub fn create_trade(
-        &mut self,
-        property_id: Uuid,
-        seller_id: Uuid,
-        tokens: u64,
-        price_per_token: Decimal,
-    ) -> Result<Uuid, &'static str> {
-        // Validate seller owns enough tokens
-        if let Some(holder) = self.token_holders.get(&seller_id) {
-            if let Some(owned_tokens) = holder.holdings.get(&property_id) {
-                if *owned_tokens >= tokens {
-                    let trade = Trade {
-                        id: Uuid::new_v4(),
-                        property_id,
-                        seller_id,
-                        buyer_id: None,
-                        tokens,
-                        price_per_token,
-                        status: TradeStatus::Open,
-                        created_at: Utc::now(),
-                        updated_at: Utc::now(),
-                    };
-                    self.trades.push(trade.clone());
-                    return Ok(trade.id);
-                }
-            }
-        }
-        Err("Insufficient tokens")
-    }
-
-    pub fn execute_trade(
-        &mut self,
-        trade_id: Uuid,
-        buyer_id: Uuid,
-    ) -> Result<(), &'static str> {
-        let trade_index = self.trades
-            .iter()
-            .position(|t| t.id == trade_id && matches!(t.status, TradeStatus::Open))
-            .ok_or("Trade not found or not open")?;
-
-        let trade = &self.trades[trade_index];
-        
-        // Transfer tokens
-        if let Some(seller) = self.token_holders.get_mut(&trade.seller_id) {
-            if let Some(buyer) = self.token_holders.get_mut(&buyer_id) {
-                *seller.holdings.entry(trade.property_id).or_insert(0) -= trade.tokens;
-                *buyer.holdings.entry(trade.property_id).or_insert(0) += trade.tokens;
-                
-                let mut updated_trade = trade.clone();
-                updated_trade.status = TradeStatus::Completed;
-                updated_trade.buyer_id = Some(buyer_id);
-                updated_trade.updated_at = Utc::now();
-                
-                self.trades[trade_index] = updated_trade;
-                return Ok(());
-            }
-        }
-        Err("Invalid trade participants")
-    }
 }
 
-// src/market_analysis.rs
-pub struct MarketAnalysis {
-    pub property_id: Uuid,
-    pub average_token_price: Decimal,
-    pub total_volume: u64,
-    pub number_of_trades: u32,
+// src/market_analyzer.rs
+pub struct MarketAnalyzer {
+    trade_history: Vec<Trade>,
+    price_predictions: HashMap<Uuid, PricePrediction>,
 }
 
-impl MarketAnalysis {
-    pub fn analyze_property_market(
-        trades: &[Trade],
-        property_id: Uuid,
-    ) -> MarketAnalysis {
-        let property_trades: Vec<&Trade> = trades
+impl MarketAnalyzer {
+    pub fn analyze_market_trends(&self, property_id: Uuid) -> MarketTrends {
+        let property_trades: Vec<&Trade> = self.trade_history
             .iter()
-            .filter(|t| t.property_id == property_id && matches!(t.status, TradeStatus::Completed))
+            .filter(|t| t.property_id == property_id)
             .collect();
-
-        let total_volume = property_trades.iter().map(|t| t.tokens).sum();
-        let total_value: Decimal = property_trades
-            .iter()
-            .map(|t| t.price_per_token * Decimal::from(t.tokens))
-            .sum();
         
-        let average_token_price = if !property_trades.is_empty() {
-            total_value / Decimal::from(total_volume)
-        } else {
-            Decimal::new(0, 0)
-        };
-
-        MarketAnalysis {
-            property_id,
-            average_token_price,
-            total_volume,
-            number_of_trades: property_trades.len() as u32,
+        let volume_24h = self.calculate_24h_volume(&property_trades);
+        let price_change = self.calculate_price_change(&property_trades);
+        let market_cap = self.calculate_market_cap(property_id);
+        
+        MarketTrends {
+            volume_24h,
+            price_change,
+            market_cap,
+            liquidity_score: self.calculate_liquidity_score(&property_trades),
         }
+    }
+    
+    pub fn predict_price(&self, property_id: Uuid) -> PricePrediction {
+        // Implementation of price prediction algorithm
+        // Using historical data and market trends
+        self.price_predictions
+            .get(&property_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+// src/security.rs
+use ring::aead::{self, UnboundKey, SealingKey, OpeningKey};
+use jsonwebtoken::{encode, decode, Header, Algorithm, Validation, EncodingKey, DecodingKey};
+
+pub struct SecurityManager {
+    encryption_key: UnboundKey,
+    jwt_secret: String,
+}
+
+impl SecurityManager {
+    pub fn new(encryption_key: &[u8], jwt_secret: &str) -> Self {
+        let unbound_key = UnboundKey::new(&aead::AES_256_GCM, encryption_key)
+            .expect("Failed to create encryption key");
+            
+        SecurityManager {
+            encryption_key: unbound_key,
+            jwt_secret: jwt_secret.to_string(),
+        }
+    }
+    
+    pub fn encrypt_sensitive_data(&self, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let sealing_key = SealingKey::new(self.encryption_key.clone());
+        // Implementation of encryption logic
+        Ok(Vec::new())
+    }
+    
+    pub fn generate_token(&self, user_id: Uuid) -> Result<String, Box<dyn std::error::Error>> {
+        let claims = TokenClaims {
+            sub: user_id.to_string(),
+            exp: (chrono::Utc::now() + chrono::Duration::hours(24)).timestamp() as usize,
+        };
+        
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(self.jwt_secret.as_bytes()),
+        )?;
+        
+        Ok(token)
     }
 }
