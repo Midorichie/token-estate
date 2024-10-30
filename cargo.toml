@@ -1,0 +1,225 @@
+// Cargo.toml
+[package]
+name = "token_estate"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+rust_decimal = "1.32"
+chrono = "0.4"
+uuid = { version = "1.6", features = ["v4"] }
+
+// src/lib.rs
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use uuid::Uuid;
+use chrono::{DateTime, Utc};
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Property {
+    pub id: Uuid,
+    pub address: String,
+    pub total_value: Decimal,
+    pub total_tokens: u64,
+    pub tokens_available: u64,
+    pub price_per_token: Decimal,
+    pub metadata: PropertyMetadata,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PropertyMetadata {
+    pub square_feet: u32,
+    pub year_built: u16,
+    pub property_type: PropertyType,
+    pub description: String,
+    pub images: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum PropertyType {
+    Residential,
+    Commercial,
+    Industrial,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TokenHolder {
+    pub id: Uuid,
+    pub wallet_address: String,
+    pub holdings: HashMap<Uuid, u64>, // Property ID -> Number of tokens
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Trade {
+    pub id: Uuid,
+    pub property_id: Uuid,
+    pub seller_id: Uuid,
+    pub buyer_id: Option<Uuid>,
+    pub tokens: u64,
+    pub price_per_token: Decimal,
+    pub status: TradeStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum TradeStatus {
+    Open,
+    Completed,
+    Cancelled,
+}
+
+// src/tokenization_engine.rs
+pub struct TokenizationEngine {
+    properties: HashMap<Uuid, Property>,
+    token_holders: HashMap<Uuid, TokenHolder>,
+    trades: Vec<Trade>,
+}
+
+impl TokenizationEngine {
+    pub fn new() -> Self {
+        TokenizationEngine {
+            properties: HashMap::new(),
+            token_holders: HashMap::new(),
+            trades: Vec::new(),
+        }
+    }
+
+    pub fn tokenize_property(
+        &mut self,
+        address: String,
+        total_value: Decimal,
+        total_tokens: u64,
+        metadata: PropertyMetadata,
+    ) -> Result<Uuid, &'static str> {
+        let property_id = Uuid::new_v4();
+        let price_per_token = total_value / Decimal::from(total_tokens);
+
+        let property = Property {
+            id: property_id,
+            address,
+            total_value,
+            total_tokens,
+            tokens_available: total_tokens,
+            price_per_token,
+            metadata,
+        };
+
+        self.properties.insert(property_id, property);
+        Ok(property_id)
+    }
+
+    pub fn create_token_holder(&mut self, wallet_address: String) -> Uuid {
+        let holder_id = Uuid::new_v4();
+        let holder = TokenHolder {
+            id: holder_id,
+            wallet_address,
+            holdings: HashMap::new(),
+        };
+        self.token_holders.insert(holder_id, holder);
+        holder_id
+    }
+
+    pub fn create_trade(
+        &mut self,
+        property_id: Uuid,
+        seller_id: Uuid,
+        tokens: u64,
+        price_per_token: Decimal,
+    ) -> Result<Uuid, &'static str> {
+        // Validate seller owns enough tokens
+        if let Some(holder) = self.token_holders.get(&seller_id) {
+            if let Some(owned_tokens) = holder.holdings.get(&property_id) {
+                if *owned_tokens >= tokens {
+                    let trade = Trade {
+                        id: Uuid::new_v4(),
+                        property_id,
+                        seller_id,
+                        buyer_id: None,
+                        tokens,
+                        price_per_token,
+                        status: TradeStatus::Open,
+                        created_at: Utc::now(),
+                        updated_at: Utc::now(),
+                    };
+                    self.trades.push(trade.clone());
+                    return Ok(trade.id);
+                }
+            }
+        }
+        Err("Insufficient tokens")
+    }
+
+    pub fn execute_trade(
+        &mut self,
+        trade_id: Uuid,
+        buyer_id: Uuid,
+    ) -> Result<(), &'static str> {
+        let trade_index = self.trades
+            .iter()
+            .position(|t| t.id == trade_id && matches!(t.status, TradeStatus::Open))
+            .ok_or("Trade not found or not open")?;
+
+        let trade = &self.trades[trade_index];
+        
+        // Transfer tokens
+        if let Some(seller) = self.token_holders.get_mut(&trade.seller_id) {
+            if let Some(buyer) = self.token_holders.get_mut(&buyer_id) {
+                *seller.holdings.entry(trade.property_id).or_insert(0) -= trade.tokens;
+                *buyer.holdings.entry(trade.property_id).or_insert(0) += trade.tokens;
+                
+                let mut updated_trade = trade.clone();
+                updated_trade.status = TradeStatus::Completed;
+                updated_trade.buyer_id = Some(buyer_id);
+                updated_trade.updated_at = Utc::now();
+                
+                self.trades[trade_index] = updated_trade;
+                return Ok(());
+            }
+        }
+        Err("Invalid trade participants")
+    }
+}
+
+// src/market_analysis.rs
+pub struct MarketAnalysis {
+    pub property_id: Uuid,
+    pub average_token_price: Decimal,
+    pub total_volume: u64,
+    pub number_of_trades: u32,
+}
+
+impl MarketAnalysis {
+    pub fn analyze_property_market(
+        trades: &[Trade],
+        property_id: Uuid,
+    ) -> MarketAnalysis {
+        let property_trades: Vec<&Trade> = trades
+            .iter()
+            .filter(|t| t.property_id == property_id && matches!(t.status, TradeStatus::Completed))
+            .collect();
+
+        let total_volume = property_trades.iter().map(|t| t.tokens).sum();
+        let total_value: Decimal = property_trades
+            .iter()
+            .map(|t| t.price_per_token * Decimal::from(t.tokens))
+            .sum();
+        
+        let average_token_price = if !property_trades.is_empty() {
+            total_value / Decimal::from(total_volume)
+        } else {
+            Decimal::new(0, 0)
+        };
+
+        MarketAnalysis {
+            property_id,
+            average_token_price,
+            total_volume,
+            number_of_trades: property_trades.len() as u32,
+        }
+    }
+}
